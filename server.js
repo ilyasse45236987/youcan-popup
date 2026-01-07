@@ -35,3 +35,12 @@ app.get("/api/status", (req, res) => {
 // ✅ PORT ديال Render
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// popup config
+app.get("/api/popup-config", (req, res) => {
+  res.json({
+    active: true,
+    title: "🔥 خصم خاص!",
+    text: "دخل الإيميل ديالك وخد 10% دابا",
+    coupon: "GASTELLO10",
+  });
+});
