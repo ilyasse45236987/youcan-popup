@@ -1,101 +1,3 @@
-console.log("✅ server.js t9ra");
-
-const express = require("express");
-const cors = require("cors");
-
-const app = express();
-app.use(express.json());
-
-// ✅ CORS (زيد دومينات ديال clients هنا ولا خليها * فالأول للتجارب)
-const ALLOWED_ORIGINS = [
-  "https://gastello.shop",
-  "https://www.gastello.shop",
-];
-
-app.use(
-  cors({
-    origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
-      // للتجارب: سمح للجميع
-      // return cb(null, true);
-
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS: " + origin));
-    },
-  })
-);
-
-// ✅ Normalize domain: يحيد www و يحيد البروتوكول و / و يحيد البورت
-function normalizeDomain(input) {
-  if (!input) return "";
-  let s = String(input).trim().toLowerCase();
-
-  // حيد protocol
-  s = s.replace(/^https?:\/\//, "");
-  // خذ غير الدومين قبل /
-  s = s.split("/")[0];
-  // حيد port
-  s = s.split(":")[0];
-  // حيد www.
-  s = s.replace(/^www\./, "");
-
-  return s;
-}
-
-// ✅ Health
-app.get("/", (req, res) => res.send("🚀 Server khdam mzyan"));
-
-// ✅ Popup config (حالياً ثابت)
-app.get("/api/popup-config", (req, res) => {
-  res.json({
-    active: true,
-    title: "🔥 خصم خاص!",
-    text: "دخل الإيميل ديالك وخد 10% دابا",
-    coupon: "GASTELLO10",
-  });
-});
-
-// ✅ Verify (حالياً: test + normalisation)
-// دابا كنخليوه يفعّل Gastello حتى إلا جاك store بـ www
-app.get("/api/verify", (req, res) => {
-  const storeRaw = (req.query.store || "").trim();
-  const key = (req.query.key || "").trim();
-
-  const store = normalizeDomain(storeRaw);
-
-  console.log("VERIFY HIT:", { storeRaw, store, key, time: new Date().toISOString() });
-
-  // ✅ Test example (بدّلها لاحقاً باش تولي من Google Sheet)
-  // كنقارن على "gastello.shop" بلا www، وراه normalized كيديرها تلقائياً
-  if (store === "gastello.shop" && key === "KEY-123") {
-    return res.json({ ok: true, status: "active", couponCode: "GASTELLO10" });
-  }
-
-  return res.json({ ok: true, status: "inactive" });
-});
-
-// ✅ Receive lead (كتسجل فـ Logs د Render)
-app.post("/api/lead", (req, res) => {
-  const body = req.body || {};
-
-  // أفضل: نستعمل hostname بلا بورت
-  const store = normalizeDomain(body.store || "");
-  const email = String(body.email || "").trim().toLowerCase();
-  const coupon = String(body.coupon || "").trim();
-  const page = String(body.page || "").trim();
-
-  console.log("✅ NEW LEAD:", {
-    store,
-    email,
-    coupon,
-    page,
-    time: new Date().toISOString(),
-  });
-
-  res.json({ ok: true });
-});
-
-// ✅ Serve popup.js
 app.get("/popup.js", (req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
 
@@ -105,10 +7,32 @@ app.get("/popup.js", (req, res) => {
       const script = document.currentScript || Array.from(document.scripts).slice(-1)[0];
       const base = new URL(script.src).origin;
 
-      const r = await fetch(base + "/api/popup-config");
+      // ✅ خذ client info من window.YOUCAN_POPUP
+      const cfgClient = (window.YOUCAN_POPUP || {});
+      const clientId = String(cfgClient.clientId || "").trim();
+      const key = String(cfgClient.key || "").trim();
+
+      if (!clientId || !key) {
+        console.log("POPUP: missing clientId/key");
+        return;
+      }
+
+      // ✅ Verify (باش ما يخدمش إلا key صحيح + domain صحيح)
+      const vr = await fetch(base + "/api/verify?clientId=" + encodeURIComponent(clientId)
+        + "&store=" + encodeURIComponent(window.location.hostname)
+        + "&key=" + encodeURIComponent(key));
+      const vj = await vr.json();
+      if (!vj || vj.status !== "active") {
+        console.log("POPUP: inactive license");
+        return;
+      }
+
+      // ✅ Get popup config ديال هاد client
+      const r = await fetch(base + "/api/popup-config?clientId=" + encodeURIComponent(clientId));
       const cfg = await r.json();
       if (!cfg || !cfg.active) return;
 
+      // ✅ ما يطلعش مرة ثانية
       if (localStorage.getItem("popup_done")) return;
 
       const wrap = document.createElement("div");
@@ -150,7 +74,8 @@ app.get("/popup.js", (req, res) => {
             method: "POST",
             headers: {"Content-Type":"application/json"},
             body: JSON.stringify({
-              store: window.location.hostname,   // ✅ هنا مضمونة
+              clientId: clientId,
+              store: window.location.hostname,
               email: email,
               coupon: cfg.coupon || "",
               page: window.location.href
@@ -173,7 +98,3 @@ app.get("/popup.js", (req, res) => {
   run();
 })();`);
 });
-
-// ✅ Render PORT
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
