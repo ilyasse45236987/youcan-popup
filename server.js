@@ -2,14 +2,35 @@ console.log("✅ server.js t9ra");
 
 const express = require("express");
 const cors = require("cors");
+const { google } = require("googleapis");
 
 const app = express();
 app.use(express.json());
+app.use(cors({ origin: true })); // فالتجارب خليه مفتوح، من بعد نقدر نسدو
 
-// ✅ CORS (خلّيه مفتوح دابا للتجارب، من بعد نسدو)
-app.use(cors({ origin: true }));
+// =====================
+// ✅ ENV REQUIRED
+// =====================
+// ADMIN_SHEET_ID=...
+// GOOGLE_CREDENTIALS_JSON={...}  (JSON كامل فـ render env)
+// OPTIONAL:
+// DEFAULT_TAB_LEADS=leads
 
-// ✅ Normalize domain: يحيد www و https و / و port
+const ADMIN_SHEET_ID = process.env.ADMIN_SHEET_ID;
+const DEFAULT_TAB_LEADS = process.env.DEFAULT_TAB_LEADS || "leads";
+
+// =====================
+// ✅ Google Sheets Auth
+// =====================
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+});
+const sheets = google.sheets({ version: "v4", auth });
+
+// =====================
+// ✅ Helpers
+// =====================
 function normalizeDomain(input) {
   if (!input) return "";
   let s = String(input).trim().toLowerCase();
@@ -20,78 +41,270 @@ function normalizeDomain(input) {
   return s;
 }
 
+function asUpper(v) {
+  return String(v || "").trim().toUpperCase();
+}
+function asLower(v) {
+  return String(v || "").trim().toLowerCase();
+}
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// =====================
+// ✅ Simple Anti-Spam (rate limit)
+// =====================
+const RATE_WINDOW_MS = 60_000; // 1 min
+const RATE_MAX = 12; // 12 clicks/min per IP
+const ipHits = new Map(); // ip -> {ts, count}
+
+function rateLimit(req, res, next) {
+  const ip =
+    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+    req.socket.remoteAddress ||
+    "unknown";
+
+  const t = Date.now();
+  const item = ipHits.get(ip) || { ts: t, count: 0 };
+
+  // reset window
+  if (t - item.ts > RATE_WINDOW_MS) {
+    item.ts = t;
+    item.count = 0;
+  }
+
+  item.count += 1;
+  ipHits.set(ip, item);
+
+  if (item.count > RATE_MAX) {
+    return res.status(429).json({ ok: false, error: "rate_limited" });
+  }
+
+  next();
+}
+
+// =====================
+// ✅ Read clients table
+// =====================
+// Admin Sheet: tab name = clients
+// Columns (A..H):
+// A clientId
+// B storeDomain
+// C licenseKey
+// D couponCode
+// E sheetId
+// F enabled (TRUE/FALSE)
+// G plan (FREE/PRO)
+// H leadLimit (number)  // only for FREE
+async function getAllClients() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: ADMIN_SHEET_ID,
+    range: "clients!A2:H",
+  });
+
+  const rows = res.data.values || [];
+  return rows.map((r) => ({
+    clientId: asLower(r[0]),
+    storeDomain: normalizeDomain(r[1]),
+    licenseKey: String(r[2] || "").trim(),
+    couponCode: String(r[3] || "").trim(),
+    sheetId: String(r[4] || "").trim(),
+    enabled: asUpper(r[5]) === "TRUE",
+    plan: asUpper(r[6] || "FREE"), // FREE / PRO
+    leadLimit: Number(r[7] || 0) || 0,
+  }));
+}
+
+async function getClient(clientId) {
+  const all = await getAllClients();
+  return all.find((c) => c.clientId === asLower(clientId)) || null;
+}
+
+async function getClientByStore(store) {
+  const st = normalizeDomain(store);
+  const all = await getAllClients();
+  return all.find((c) => c.storeDomain === st) || null;
+}
+
+// =====================
 // ✅ Health
+// =====================
 app.get("/", (req, res) => res.send("🚀 Server khdam mzyan"));
 
-// ✅ Verify (test حاليا) — بدّلهم لاحقا بالقراءة من Admin Sheet
-app.get("/api/verify", (req, res) => {
-  const clientId = String(req.query.clientId || "").trim().toLowerCase();
-  const storeRaw = String(req.query.store || "").trim();
-  const key = String(req.query.key || "").trim();
+// =====================
+// ✅ Verify license (FROM SHEET)
+// =====================
+app.get("/api/verify", async (req, res) => {
+  try {
+    const clientId = asLower(req.query.clientId);
+    const store = normalizeDomain(req.query.store);
+    const key = String(req.query.key || "").trim();
 
-  const store = normalizeDomain(storeRaw);
+    console.log("VERIFY HIT:", { clientId, store, key, time: nowISO() });
 
-  console.log("VERIFY HIT:", { clientId, storeRaw, store, key, time: new Date().toISOString() });
+    if (!clientId || !store || !key) {
+      return res.json({ ok: true, status: "inactive" });
+    }
 
-  // ✅ مثال ديال gastello
-  if (clientId === "gastello" && store === "gastello.shop" && key === "KEY-123") {
-    return res.json({ ok: true, status: "active", couponCode: "GASTELLO10" });
+    const client = await getClient(clientId);
+    if (!client || !client.enabled) return res.json({ ok: true, status: "inactive" });
+
+    // ✅ accept www/bare because we normalize both
+    if (normalizeDomain(client.storeDomain) !== store) {
+      return res.json({ ok: true, status: "inactive" });
+    }
+
+    if (client.licenseKey !== key) return res.json({ ok: true, status: "inactive" });
+
+    return res.json({
+      ok: true,
+      status: "active",
+      couponCode: client.couponCode || "",
+      plan: client.plan || "FREE",
+    });
+  } catch (e) {
+    console.log("VERIFY ERROR:", e.message);
+    return res.json({ ok: true, status: "inactive" });
   }
+});
 
-  // ✅ مثال ديال www حتى هو كيتحوّل لبلا www ف normalize
-  if (clientId === "gastello" && store === "gastello.shop" && key === "KEY-123") {
-    return res.json({ ok: true, status: "active", couponCode: "GASTELLO10" });
+// =====================
+// ✅ Popup config (PER CLIENT)
+// =====================
+app.get("/api/popup-config", async (req, res) => {
+  try {
+    const clientId = asLower(req.query.clientId);
+    if (!clientId) {
+      return res.json({ active: false });
+    }
+
+    const client = await getClient(clientId);
+    if (!client || !client.enabled) return res.json({ active: false });
+
+    // تقدر تبدل هاد النصوص لاحقاً و حتى تخليهم فـ Sheet (نسخة قادمة)
+    return res.json({
+      active: true,
+      title: "🔥 خصم خاص!",
+      text: "دخل الإيميل ديالك وخد 10% دابا",
+      coupon: client.couponCode || "",
+    });
+  } catch (e) {
+    console.log("POPUP-CONFIG ERROR:", e.message);
+    return res.json({ active: false });
   }
-
-  return res.json({ ok: true, status: "inactive" });
 });
 
-// ✅ Popup config (ثابت حاليا) — لاحقا نخليه per-client
-app.get("/api/popup-config", (req, res) => {
-  res.json({
-    active: true,
-    title: "🔥 خصم خاص!",
-    text: "دخل الإيميل ديالك وخد 10% دابا",
-    coupon: "GASTELLO10",
+// =====================
+// ✅ Count leads in client sheet (for FREE limit)
+// =====================
+async function getLeadCount(clientSheetId) {
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: clientSheetId,
+    range: `${DEFAULT_TAB_LEADS}!A2:A`,
   });
-});
+  const rows = resp.data.values || [];
+  return rows.length;
+}
 
-// ✅ Lead (دابا كنسجلو فـ logs مع clientId)
-app.post("/api/lead", (req, res) => {
-  const { clientId, store, email, coupon, page } = req.body || {};
-
-  console.log("✅ NEW LEAD:", {
-    clientId: String(clientId || "").trim().toLowerCase(),
-    store: normalizeDomain(store || ""),
-    email: String(email || "").trim().toLowerCase(),
-    coupon: String(coupon || "").trim(),
-    page: String(page || "").trim(),
-    time: new Date().toISOString(),
+// =====================
+// ✅ Anti-duplicate by email
+// =====================
+async function emailExists(clientSheetId, emailLower) {
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: clientSheetId,
+    range: `${DEFAULT_TAB_LEADS}!A2:E`,
   });
+  const rows = resp.data.values || [];
+  return rows.some((r) => asLower(r[2]) === emailLower);
+}
 
-  // ⚠️ هنا من بعد غادي نزيدو الكتابة للـ Google Sheets
-  res.json({ ok: true });
+// =====================
+// ✅ Save lead to client sheet
+// =====================
+app.post("/api/lead", rateLimit, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const clientId = asLower(body.clientId);
+    const store = normalizeDomain(body.store);
+    const email = asLower(body.email);
+    const coupon = String(body.coupon || "").trim();
+    const page = String(body.page || "").trim();
+
+    console.log("✅ NEW LEAD:", { clientId, store, email, coupon, page, time: nowISO() });
+
+    if (!clientId || !store || !email) {
+      return res.json({ ok: false, error: "missing_fields" });
+    }
+
+    const client = await getClient(clientId);
+    if (!client || !client.enabled) {
+      return res.json({ ok: false, error: "inactive_client" });
+    }
+
+    // verify store matches client store
+    if (normalizeDomain(client.storeDomain) !== store) {
+      return res.json({ ok: false, error: "store_mismatch" });
+    }
+
+    // must have sheetId
+    if (!client.sheetId) {
+      return res.json({ ok: false, error: "missing_sheetId" });
+    }
+
+    // FREE plan limit
+    if (client.plan === "FREE" && client.leadLimit > 0) {
+      const cnt = await getLeadCount(client.sheetId);
+      if (cnt >= client.leadLimit) {
+        return res.json({ ok: false, error: "free_limit_reached" });
+      }
+    }
+
+    // anti-duplicate
+    const exists = await emailExists(client.sheetId, email);
+    if (exists) {
+      return res.json({ ok: true, duplicate: true });
+    }
+
+    // append
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: client.sheetId,
+      range: `${DEFAULT_TAB_LEADS}!A:E`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [[nowISO(), store, email, coupon, page]],
+      },
+    });
+
+    console.log("✅ LEAD SAVED TO SHEET:", clientId, email);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.log("❌ LEAD ERROR:", e.message);
+    return res.json({ ok: false, error: "server_error" });
+  }
 });
 
-// ✅ Serve popup.js (مهم: كيبعث clientId + key)
+// =====================
+// ✅ popup.js (client mode)
+// =====================
 app.get("/popup.js", (req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+
   res.send(`(function () {
   async function run() {
     try {
       const script = document.currentScript || Array.from(document.scripts).slice(-1)[0];
       const base = new URL(script.src).origin;
 
-      const settings = (window.YOUCAN_POPUP || {});
-      const clientId = String(settings.clientId || "").trim();
-      const key = String(settings.key || "").trim();
+      const s = (window.YOUCAN_POPUP || {});
+      const clientId = String(s.clientId || "").trim();
+      const key = String(s.key || "").trim();
 
       if (!clientId || !key) {
         console.log("POPUP: missing clientId/key");
         return;
       }
 
-      // ✅ verify license
+      // Verify first
       const vr = await fetch(base + "/api/verify?clientId=" + encodeURIComponent(clientId)
         + "&store=" + encodeURIComponent(window.location.hostname)
         + "&key=" + encodeURIComponent(key));
@@ -101,7 +314,8 @@ app.get("/popup.js", (req, res) => {
         return;
       }
 
-      const r = await fetch(base + "/api/popup-config");
+      // Get per-client config
+      const r = await fetch(base + "/api/popup-config?clientId=" + encodeURIComponent(clientId));
       const cfg = await r.json();
       if (!cfg || !cfg.active) return;
 
@@ -141,21 +355,33 @@ app.get("/popup.js", (req, res) => {
         const email = document.getElementById("popup_email").value.trim();
         if (!email) return alert("كتب الإيميل أولاً");
 
-        await fetch(base + "/api/lead", {
-          method: "POST",
-          headers: {"Content-Type":"application/json"},
-          body: JSON.stringify({
-            clientId: clientId,
-            store: window.location.hostname,
-            email: email,
-            coupon: cfg.coupon || "",
-            page: window.location.href
-          })
-        });
+        try {
+          const rr = await fetch(base + "/api/lead", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({
+              clientId: clientId,
+              store: window.location.hostname,
+              email: email,
+              coupon: cfg.coupon || "",
+              page: window.location.href
+            })
+          });
 
-        localStorage.setItem("popup_done","1");
-        alert("🎉 Coupon: " + (cfg.coupon || ""));
-        wrap.remove();
+          const jj = await rr.json().catch(() => ({}));
+
+          if (jj && jj.error === "free_limit_reached") {
+            alert("وصلتو للحد ديال النسخة المجانية");
+            return;
+          }
+
+          localStorage.setItem("popup_done","1");
+          alert("🎉 Coupon: " + (cfg.coupon || ""));
+          wrap.remove();
+        } catch(e) {
+          console.log("LEAD POST ERROR:", e);
+          alert("وقع مشكل، عاود حاول");
+        }
       };
 
     } catch(e) {
@@ -166,6 +392,8 @@ app.get("/popup.js", (req, res) => {
 })();`);
 });
 
-// ✅ Render PORT
+// =====================
+// ✅ Start
+// =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
