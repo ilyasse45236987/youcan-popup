@@ -1,46 +1,14 @@
-console.log("✅ server.js t9ra");
+app.get("/api/verify", (req, res) => {
+  const store = (req.query.store || "").trim();
+  const key = (req.query.key || "").trim();
+  const origin = req.headers.origin || "";
 
-const express = require("express");
-const cors = require("cors");
+  console.log("VERIFY HIT:", { store, key, origin, time: new Date().toISOString() });
 
-const app = express();
-app.use(express.json());
+  // ✅ Test بسيط: بدّلهم بحال client
+  if (store === "client-test.shop" && key === "TEST-123") {
+    return res.json({ ok: true, status: "active", couponCode: "TEST10" });
+  }
 
-// ✅ بدّل هاد الدومين لدومين موقعك
-const ALLOWED_ORIGINS = [
-  "https://gastello.shop",
-  "https://www.gastello.shop",
-];
-
-app.use(
-  cors({
-    origin: function (origin, cb) {
-      // يسمح للطلبات اللي ما فيهاش origin (بحال Postman) + الدومينات المسموح بها
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS: " + origin));
-    },
-    credentials: true,
-  })
-);
-
-// ✅ health check
-app.get("/", (req, res) => res.send("🚀 Server khdam mzyan"));
-
-// ✅ status endpoint (باش YouCan يشوف واش Active)
-app.get("/api/status", (req, res) => {
-  res.json({ ok: true, status: "active" });
-});
-
-// ✅ PORT ديال Render
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-// popup config
-app.get("/api/popup-config", (req, res) => {
-  res.json({
-    active: true,
-    title: "🔥 خصم خاص!",
-    text: "دخل الإيميل ديالك وخد 10% دابا",
-    coupon: "GASTELLO10",
-  });
+  return res.json({ ok: true, status: "inactive" });
 });
