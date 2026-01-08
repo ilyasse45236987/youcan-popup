@@ -1,188 +1,321 @@
-console.log("✅ server.js t9ra");
+console.log("✅ server.js loaded");
 
 const express = require("express");
 const cors = require("cors");
 
 const app = express();
+app.use(express.json({ limit: "200kb" }));
 
-/* ===============================
-   MIDDLEWARE (ضروري يكون قبل routes)
-================================ */
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+/**
+ * =========================================
+ * 1) CLIENTS CONFIG (SaaS)
+ * كل client كتزيدو هنا:
+ *  - domains: الدومينات اللي غادي يخدم فيهم popup
+ *  - licenseKey: key اللي كتبيع بيه (اختياري إلا بغيت verify)
+ *  - popup: النص + الكوبون
+ * =========================================
+ */
+const CLIENTS = [
+  {
+    id: "gastello",
+    domains: ["gastello.shop", "www.gastello.shop"],
+    licenseKey: "GASTELLO-KEY-123", // بدلو لاحقاً
+    popup: {
+      active: true,
+      title: "🔥 خصم خاص!",
+      text: "دخل الإيميل ديالك وخد 10% دابا",
+      coupon: "GASTELLO10",
+    },
+  },
 
-const ALLOWED_ORIGINS = [
-  "https://gastello.shop",
-  "https://www.gastello.shop",
+  // مثال ديال client-test
+  {
+    id: "client-test",
+    domains: ["client-test.shop", "www.client-test.shop"],
+    licenseKey: "TEST-123",
+    popup: {
+      active: true,
+      title: "🎁 Welcome!",
+      text: "دخل الإيميل وخد كوبون الترحيب",
+      coupon: "TEST10",
+    },
+  },
 ];
 
+/**
+ * Helper: نجيبو client حسب domain
+ */
+function getClientByDomain(domain) {
+  const d = (domain || "").toLowerCase().trim();
+  return CLIENTS.find((c) => c.domains.map((x) => x.toLowerCase()).includes(d));
+}
+
+/**
+ * Helper: نجيبو domain من request
+ * - كنستعملو Origin أو Referer أو Host
+ */
+function getReqDomain(req) {
+  const origin = req.headers.origin || "";
+  const referer = req.headers.referer || "";
+  const host = req.headers.host || "";
+
+  function toDomain(urlOrHost) {
+    try {
+      if (!urlOrHost) return "";
+      if (urlOrHost.includes("http")) return new URL(urlOrHost).hostname;
+      return urlOrHost.split(":")[0]; // remove port
+    } catch {
+      return "";
+    }
+  }
+
+  return toDomain(origin) || toDomain(referer) || toDomain(host);
+}
+
+/**
+ * =========================================
+ * 2) CORS ديناميكي: كنسمحو غير للدومينات اللي مسجلين
+ * =========================================
+ */
 app.use(
   cors({
     origin: function (origin, cb) {
+      // requests بلا origin (بحال curl) كنسمحو ليها
       if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+      let domain = "";
+      try {
+        domain = new URL(origin).hostname.toLowerCase();
+      } catch {
+        return cb(new Error("Bad origin: " + origin));
+      }
+
+      const client = getClientByDomain(domain);
+      if (client) return cb(null, true);
+
       return cb(new Error("Not allowed by CORS: " + origin));
     },
   })
 );
 
-/* ===============================
-   HEALTH CHECK
-================================ */
-app.get("/", (req, res) => {
-  res.send("🚀 Server khdam mzyan");
-});
+/**
+ * =========================================
+ * 3) Health
+ * =========================================
+ */
+app.get("/", (req, res) => res.send("🚀 Server running OK"));
 
-/* ===============================
-   STATUS
-================================ */
-app.get("/api/status", (req, res) => {
-  res.json({ ok: true, status: "active" });
-});
-
-/* ===============================
-   VERIFY (license test)
-================================ */
+/**
+ * =========================================
+ * 4) License verify
+ * GET /api/verify?store=clientdomain.com&key=XXXX
+ * =========================================
+ */
 app.get("/api/verify", (req, res) => {
-  const store = (req.query.store || "").trim();
+  const store = (req.query.store || "").trim().toLowerCase();
   const key = (req.query.key || "").trim();
 
-  console.log("VERIFY HIT:", {
-    store,
-    key,
-    time: new Date().toISOString(),
-  });
+  const client = getClientByDomain(store);
 
-  if (store === "client-test.shop" && key === "TEST-123") {
+  console.log("VERIFY HIT:", { store, key, time: new Date().toISOString() });
+
+  if (!client) return res.json({ ok: true, status: "inactive" });
+
+  if (!client.licenseKey) {
+    // إلا ما بغيتيش license حالياً
+    return res.json({ ok: true, status: "active" });
+  }
+
+  if (key === client.licenseKey) {
     return res.json({
       ok: true,
       status: "active",
-      couponCode: "TEST10",
+      clientId: client.id,
+      couponCode: client.popup?.coupon || "",
     });
   }
 
   return res.json({ ok: true, status: "inactive" });
 });
 
-/* ===============================
-   POPUP CONFIG
-================================ */
+/**
+ * =========================================
+ * 5) Popup config حسب domain
+ * GET /api/popup-config
+ * =========================================
+ */
 app.get("/api/popup-config", (req, res) => {
-  res.json({
-    active: true,
-    title: "🔥 خصم خاص!",
-    text: "دخل الإيميل ديالك وخد 10% دابا",
-    coupon: "GASTELLO10",
+  const domain = getReqDomain(req);
+
+  const client = getClientByDomain(domain);
+  if (!client) {
+    return res.json({
+      active: false,
+      title: "",
+      text: "",
+      coupon: "",
+      reason: "unknown_domain",
+    });
+  }
+
+  return res.json({
+    active: !!client.popup?.active,
+    title: client.popup?.title || "",
+    text: client.popup?.text || "",
+    coupon: client.popup?.coupon || "",
+    clientId: client.id,
   });
 });
 
-/* ===============================
-   RECEIVE LEAD (DEBUG + LOG)
-================================ */
-app.post("/api/lead", (req, res) => {
-  console.log("📩 HEADERS:", req.headers["content-type"]);
-  console.log("📩 BODY RAW:", req.body);
+/**
+ * =========================================
+ * 6) Anti-duplicate
+ * كنبلوكي duplication (store+email) لمدة 24 ساعة
+ * =========================================
+ */
+const seen = new Map();
+// key -> timestamp
+function isDuplicate(key) {
+  const now = Date.now();
+  const ttl = 24 * 60 * 60 * 1000; // 24h
+  const last = seen.get(key);
+  if (last && now - last < ttl) return true;
+  seen.set(key, now);
+  return false;
+}
 
+/**
+ * =========================================
+ * 7) Receive lead
+ * POST /api/lead
+ * body: { store, email, coupon, page }
+ * =========================================
+ */
+app.post("/api/lead", (req, res) => {
   const { store, email, coupon, page } = req.body || {};
 
+  const cleanStore = (store || "").trim().toLowerCase();
+  const cleanEmail = (email || "").trim().toLowerCase();
+
+  if (!cleanStore || !cleanEmail) {
+    console.log("⛔ BAD LEAD:", { body: req.body });
+    return res.status(400).json({ ok: false, error: "missing_store_or_email" });
+  }
+
+  const client = getClientByDomain(cleanStore);
+  if (!client) {
+    console.log("⛔ LEAD FROM UNKNOWN STORE:", { store: cleanStore, email: cleanEmail });
+    return res.status(403).json({ ok: false, error: "unknown_store" });
+  }
+
+  // duplicate key per day
+  const dupKey = client.id + "|" + cleanStore + "|" + cleanEmail;
+
+  if (isDuplicate(dupKey)) {
+    console.log("⛔ DUPLICATE BLOCKED:", dupKey);
+    return res.json({ ok: true, duplicate: true });
+  }
+
   console.log("✅ NEW LEAD:", {
-    store,
-    email,
-    coupon,
-    page,
+    clientId: client.id,
+    store: cleanStore,
+    email: cleanEmail,
+    coupon: (coupon || "").trim(),
+    page: (page || "").trim(),
     time: new Date().toISOString(),
   });
 
-  res.json({ ok: true });
+  // دابا غير logs (من بعد غادي ندوزوه لـ Google Sheets)
+  return res.json({ ok: true });
 });
 
-/* ===============================
-   POPUP.JS (external script)
-================================ */
+/**
+ * =========================================
+ * 8) popup.js (single script for all clients)
+ * GET /popup.js
+ * =========================================
+ */
 app.get("/popup.js", (req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
 
-  res.send(`
-(function () {
-  async function run() {
-    try {
-      const script =
-        document.currentScript ||
-        Array.from(document.scripts).slice(-1)[0];
+  res.send(`(function () {
+  try {
+    var script = document.currentScript || (function(){ var s=document.getElementsByTagName('script'); return s[s.length-1]; })();
+    var base = new URL(script.src).origin;
 
-      const base = new URL(script.src).origin;
+    // anti-load twice
+    if (window.__YOUCAN_POPUP_LOADED__) return;
+    window.__YOUCAN_POPUP_LOADED__ = true;
 
-      const r = await fetch(base + "/api/popup-config");
-      const cfg = await r.json();
+    // fetch config
+    fetch(base + "/api/popup-config", { credentials: "omit" })
+      .then(function(r){ return r.json(); })
+      .then(function(cfg){
+        if (!cfg || !cfg.active) return;
 
-      if (!cfg || !cfg.active) return;
-      if (localStorage.getItem("popup_done")) return;
+        // show once
+        if (localStorage.getItem("youcan_popup_done_v1")) return;
 
-      const wrap = document.createElement("div");
-      wrap.innerHTML = \`
-        <div style="
-          position:fixed;bottom:20px;right:20px;
-          background:#fff;padding:15px;
-          box-shadow:0 0 15px rgba(0,0,0,.2);
-          z-index:999999;max-width:320px;
-          border-radius:12px;font-family:Arial,sans-serif">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <strong>\${cfg.title || ""}</strong>
-            <button id="popup_close" style="border:none;background:none;font-size:18px;cursor:pointer">×</button>
-          </div>
-          <p style="margin:10px 0">\${cfg.text || ""}</p>
-          <input id="popup_email" type="email" placeholder="Email"
-            style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"/>
-          <button id="popup_btn"
-            style="margin-top:10px;width:100%;padding:10px;
-            background:#000;color:#fff;border:none;border-radius:8px;cursor:pointer">
-            خد الكود
-          </button>
-        </div>
-      \`;
+        // UI
+        var overlay = document.createElement("div");
+        overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999999;display:flex;align-items:center;justify-content:center;padding:16px;";
+        overlay.innerHTML =
+          '<div style="background:#fff;border-radius:14px;max-width:360px;width:100%;padding:16px;font-family:Arial,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.25)">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">' +
+              '<div style="font-size:16px;font-weight:700">' + (cfg.title || "") + '</div>' +
+              '<button id="yc_close" style="border:none;background:transparent;font-size:20px;cursor:pointer;line-height:1">×</button>' +
+            '</div>' +
+            '<div style="margin-top:10px;color:#333;font-size:14px;line-height:1.5">' + (cfg.text || "") + '</div>' +
+            '<input id="yc_email" type="email" placeholder="Email" style="margin-top:12px;width:100%;padding:12px;border:1px solid #ddd;border-radius:10px;font-size:14px;outline:none" />' +
+            '<button id="yc_btn" style="margin-top:12px;width:100%;padding:12px;border:none;border-radius:10px;background:#111;color:#fff;font-weight:700;font-size:14px;cursor:pointer">خذ الكود</button>' +
+            '<div style="margin-top:8px;font-size:12px;color:#777">* غادي يبان ليك الكوبون مباشرة</div>' +
+          '</div>';
 
-      document.body.appendChild(wrap);
+        document.body.appendChild(overlay);
 
-      document.getElementById("popup_close").onclick = () => wrap.remove();
+        document.getElementById("yc_close").onclick = function(){
+          overlay.remove();
+        };
 
-      document.getElementById("popup_btn").onclick = async () => {
-        const email = document.getElementById("popup_email").value.trim();
-        if (!email) return alert("كتب الإيميل أولاً");
+        var sending = false;
+        document.getElementById("yc_btn").onclick = function(){
+          if (sending) return;
+          sending = true;
 
-        try {
-          await fetch(base + "/api/lead", {
+          var email = (document.getElementById("yc_email").value || "").trim();
+          if (!email) { sending = false; return alert("كتب الإيميل أولاً"); }
+
+          fetch(base + "/api/lead", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {"Content-Type":"application/json"},
             body: JSON.stringify({
               store: window.location.host,
               email: email,
               coupon: cfg.coupon || "",
               page: window.location.href
             })
+          }).then(function(){
+            localStorage.setItem("youcan_popup_done_v1", "1");
+            alert("🎉 Coupon: " + (cfg.coupon || ""));
+            overlay.remove();
+          }).catch(function(e){
+            console.log("LEAD POST ERROR:", e);
+            sending = false;
+            alert("وقع مشكل، عاود حاول");
           });
-
-          localStorage.setItem("popup_done", "1");
-          alert("🎉 Coupon: " + (cfg.coupon || ""));
-          wrap.remove();
-        } catch (e) {
-          console.log("LEAD POST ERROR:", e);
-          alert("وقع مشكل، عاود حاول");
-        }
-      };
-    } catch (e) {
-      console.log("POPUP ERROR:", e);
-    }
+        };
+      })
+      .catch(function(e){ console.log("POPUP ERROR:", e); });
+  } catch(e) {
+    console.log("POPUP INIT ERROR:", e);
   }
-
-  run();
-})();
-`);
+})();`);
 });
 
-/* ===============================
-   START SERVER (Render)
-================================ */
+/**
+ * =========================================
+ * 9) Render PORT
+ * =========================================
+ */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("✅ Server running on port " + PORT);
-});
+app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
