@@ -61,7 +61,7 @@ async function getClientByStore(storeDomain) {
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: ADMIN_SHEET_ID,
-    range: "clients!A2:H",
+    range: "clients!A2:F",
   });
 
   const rows = res.data.values || [];
