@@ -6,394 +6,246 @@ const { google } = require("googleapis");
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: true })); // فالتجارب خليه مفتوح، من بعد نقدر نسدو
 
-// =====================
-// ✅ ENV REQUIRED
-// =====================
-// ADMIN_SHEET_ID=...
-// GOOGLE_CREDENTIALS_JSON={...}  (JSON كامل فـ render env)
-// OPTIONAL:
-// DEFAULT_TAB_LEADS=leads
+/* =======================
+   CONFIG
+======================= */
 
+// 🔹 Admin Sheet ID (ديال sheet اللي فيه tab clients)
 const ADMIN_SHEET_ID = process.env.ADMIN_SHEET_ID;
-const DEFAULT_TAB_LEADS = process.env.DEFAULT_TAB_LEADS || "leads";
 
-// =====================
-// ✅ Google Sheets Auth
-// =====================
+// 🔹 Google Service Account JSON (كامل)
+const GOOGLE_CREDENTIALS_JSON = JSON.parse(
+  process.env.GOOGLE_CREDENTIALS_JSON
+);
+
+// 🔹 CORS (زيد domains ديال clients)
+const ALLOWED_ORIGINS = [
+  "https://gastello.shop",
+  "https://www.gastello.shop",
+];
+
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS: " + origin));
+    },
+  })
+);
+
+/* =======================
+   GOOGLE SHEETS SETUP
+======================= */
+
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON),
+  credentials: GOOGLE_CREDENTIALS_JSON,
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
+
 const sheets = google.sheets({ version: "v4", auth });
 
-// =====================
-// ✅ Helpers
-// =====================
-function normalizeDomain(input) {
-  if (!input) return "";
-  let s = String(input).trim().toLowerCase();
-  s = s.replace(/^https?:\/\//, "");
-  s = s.split("/")[0];
-  s = s.split(":")[0];
-  s = s.replace(/^www\./, "");
-  return s;
+/* =======================
+   HELPERS
+======================= */
+
+// normalize domain (يحيد www)
+function normalizeDomain(domain = "") {
+  return domain.replace(/^www\./, "").toLowerCase();
 }
 
-function asUpper(v) {
-  return String(v || "").trim().toUpperCase();
-}
-function asLower(v) {
-  return String(v || "").trim().toLowerCase();
-}
-function nowISO() {
-  return new Date().toISOString();
-}
+// get client from admin sheet
+async function getClientByStore(storeDomain) {
+  const cleanStore = normalizeDomain(storeDomain);
 
-// =====================
-// ✅ Simple Anti-Spam (rate limit)
-// =====================
-const RATE_WINDOW_MS = 60_000; // 1 min
-const RATE_MAX = 12; // 12 clicks/min per IP
-const ipHits = new Map(); // ip -> {ts, count}
-
-function rateLimit(req, res, next) {
-  const ip =
-    (req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-    req.socket.remoteAddress ||
-    "unknown";
-
-  const t = Date.now();
-  const item = ipHits.get(ip) || { ts: t, count: 0 };
-
-  // reset window
-  if (t - item.ts > RATE_WINDOW_MS) {
-    item.ts = t;
-    item.count = 0;
-  }
-
-  item.count += 1;
-  ipHits.set(ip, item);
-
-  if (item.count > RATE_MAX) {
-    return res.status(429).json({ ok: false, error: "rate_limited" });
-  }
-
-  next();
-}
-
-// =====================
-// ✅ Read clients table
-// =====================
-// Admin Sheet: tab name = clients
-// Columns (A..H):
-// A clientId
-// B storeDomain
-// C licenseKey
-// D couponCode
-// E sheetId
-// F enabled (TRUE/FALSE)
-// G plan (FREE/PRO)
-// H leadLimit (number)  // only for FREE
-async function getAllClients() {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: ADMIN_SHEET_ID,
     range: "clients!A2:H",
   });
 
   const rows = res.data.values || [];
-  return rows.map((r) => ({
-    clientId: asLower(r[0]),
-    storeDomain: normalizeDomain(r[1]),
-    licenseKey: String(r[2] || "").trim(),
-    couponCode: String(r[3] || "").trim(),
-    sheetId: String(r[4] || "").trim(),
-    enabled: asUpper(r[5]) === "TRUE",
-    plan: asUpper(r[6] || "FREE"), // FREE / PRO
-    leadLimit: Number(r[7] || 0) || 0,
-  }));
+
+  for (const row of rows) {
+    const [
+      clientId,
+      store,
+      licenseKey,
+      couponCode,
+      sheetId,
+      enabled,
+      plan,
+      leadLimit,
+    ] = row;
+
+    if (normalizeDomain(store) === cleanStore) {
+      return {
+        clientId,
+        store,
+        licenseKey,
+        couponCode,
+        sheetId,
+        enabled: String(enabled).toLowerCase() === "true",
+        plan,
+        leadLimit: Number(leadLimit || 0),
+      };
+    }
+  }
+
+  return null;
 }
 
-async function getClient(clientId) {
-  const all = await getAllClients();
-  return all.find((c) => c.clientId === asLower(clientId)) || null;
-}
+/* =======================
+   ROUTES
+======================= */
 
-async function getClientByStore(store) {
-  const st = normalizeDomain(store);
-  const all = await getAllClients();
-  return all.find((c) => c.storeDomain === st) || null;
-}
+// 🔹 Health
+app.get("/", (req, res) => {
+  res.send("🚀 Server khdam mzyan");
+});
 
-// =====================
-// ✅ Health
-// =====================
-app.get("/", (req, res) => res.send("🚀 Server khdam mzyan"));
-
-// =====================
-// ✅ Verify license (FROM SHEET)
-// =====================
+// 🔹 Verify license
 app.get("/api/verify", async (req, res) => {
   try {
-    const clientId = asLower(req.query.clientId);
-    const store = normalizeDomain(req.query.store);
-    const key = String(req.query.key || "").trim();
+    const store = req.query.store || "";
+    const key = req.query.key || "";
 
-    console.log("VERIFY HIT:", { clientId, store, key, time: nowISO() });
+    const client = await getClientByStore(store);
 
-    if (!clientId || !store || !key) {
+    if (!client || !client.enabled) {
       return res.json({ ok: true, status: "inactive" });
     }
 
-    const client = await getClient(clientId);
-    if (!client || !client.enabled) return res.json({ ok: true, status: "inactive" });
-
-    // ✅ accept www/bare because we normalize both
-    if (normalizeDomain(client.storeDomain) !== store) {
+    if (client.licenseKey !== key) {
       return res.json({ ok: true, status: "inactive" });
     }
-
-    if (client.licenseKey !== key) return res.json({ ok: true, status: "inactive" });
 
     return res.json({
       ok: true,
       status: "active",
       couponCode: client.couponCode || "",
-      plan: client.plan || "FREE",
     });
   } catch (e) {
-    console.log("VERIFY ERROR:", e.message);
-    return res.json({ ok: true, status: "inactive" });
+    console.error("VERIFY ERROR:", e.message);
+    res.status(500).json({ ok: false, error: "verify_error" });
   }
 });
 
-// =====================
-// ✅ Popup config (PER CLIENT)
-// =====================
-app.get("/api/popup-config", async (req, res) => {
-  try {
-    const clientId = asLower(req.query.clientId);
-    if (!clientId) {
-      return res.json({ active: false });
-    }
-
-    const client = await getClient(clientId);
-    if (!client || !client.enabled) return res.json({ active: false });
-
-    // تقدر تبدل هاد النصوص لاحقاً و حتى تخليهم فـ Sheet (نسخة قادمة)
-    return res.json({
-      active: true,
-      title: "🔥 خصم خاص!",
-      text: "دخل الإيميل ديالك وخد 10% دابا",
-      coupon: client.couponCode || "",
-    });
-  } catch (e) {
-    console.log("POPUP-CONFIG ERROR:", e.message);
-    return res.json({ active: false });
-  }
+// 🔹 Popup config
+app.get("/api/popup-config", (req, res) => {
+  res.json({
+    active: true,
+    title: "🔥 خصم خاص!",
+    text: "دخل الإيميل ديالك وخد 10% دابا",
+    coupon: "GASTELLO10",
+  });
 });
 
-// =====================
-// ✅ Count leads in client sheet (for FREE limit)
-// =====================
-async function getLeadCount(clientSheetId) {
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: clientSheetId,
-    range: `${DEFAULT_TAB_LEADS}!A2:A`,
-  });
-  const rows = resp.data.values || [];
-  return rows.length;
-}
-
-// =====================
-// ✅ Anti-duplicate by email
-// =====================
-async function emailExists(clientSheetId, emailLower) {
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: clientSheetId,
-    range: `${DEFAULT_TAB_LEADS}!A2:E`,
-  });
-  const rows = resp.data.values || [];
-  return rows.some((r) => asLower(r[2]) === emailLower);
-}
-
-// =====================
-// ✅ Save lead to client sheet
-// =====================
-app.post("/api/lead", rateLimit, async (req, res) => {
+// 🔹 Receive lead + write to client sheet
+app.post("/api/lead", async (req, res) => {
   try {
-    const body = req.body || {};
-    const clientId = asLower(body.clientId);
-    const store = normalizeDomain(body.store);
-    const email = asLower(body.email);
-    const coupon = String(body.coupon || "").trim();
-    const page = String(body.page || "").trim();
-
-    console.log("✅ NEW LEAD:", { clientId, store, email, coupon, page, time: nowISO() });
-
-    if (!clientId || !store || !email) {
-      return res.json({ ok: false, error: "missing_fields" });
+    const { store, email, coupon, page } = req.body || {};
+    if (!store || !email) {
+      return res.status(400).json({ ok: false });
     }
 
-    const client = await getClient(clientId);
+    const client = await getClientByStore(store);
     if (!client || !client.enabled) {
-      return res.json({ ok: false, error: "inactive_client" });
+      return res.json({ ok: true });
     }
 
-    // verify store matches client store
-    if (normalizeDomain(client.storeDomain) !== store) {
-      return res.json({ ok: false, error: "store_mismatch" });
-    }
+    const time = new Date().toISOString();
 
-    // must have sheetId
-    if (!client.sheetId) {
-      return res.json({ ok: false, error: "missing_sheetId" });
-    }
+    console.log("✅ NEW LEAD:", {
+      clientId: client.clientId,
+      store,
+      email,
+      coupon,
+      page,
+      time,
+    });
 
-    // FREE plan limit
-    if (client.plan === "FREE" && client.leadLimit > 0) {
-      const cnt = await getLeadCount(client.sheetId);
-      if (cnt >= client.leadLimit) {
-        return res.json({ ok: false, error: "free_limit_reached" });
-      }
-    }
-
-    // anti-duplicate
-    const exists = await emailExists(client.sheetId, email);
-    if (exists) {
-      return res.json({ ok: true, duplicate: true });
-    }
-
-    // append
+    // ✍️ write to client sheet (tab: leads)
     await sheets.spreadsheets.values.append({
       spreadsheetId: client.sheetId,
-      range: `${DEFAULT_TAB_LEADS}!A:E`,
+      range: "leads!A:E",
       valueInputOption: "USER_ENTERED",
       requestBody: {
-        values: [[nowISO(), store, email, coupon, page]],
+        values: [[time, email, coupon || "", page || "", store]],
       },
     });
 
-    console.log("✅ LEAD SAVED TO SHEET:", clientId, email);
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
-    console.log("❌ LEAD ERROR:", e.message);
-    return res.json({ ok: false, error: "server_error" });
+    console.error("LEAD ERROR:", e.message);
+    res.status(500).json({ ok: false });
   }
 });
 
-// =====================
-// ✅ popup.js (client mode)
-// =====================
+// 🔹 popup.js (external script)
 app.get("/popup.js", (req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-
   res.send(`(function () {
-  async function run() {
-    try {
-      const script = document.currentScript || Array.from(document.scripts).slice(-1)[0];
-      const base = new URL(script.src).origin;
+    async function run() {
+      try {
+        const script = document.currentScript || Array.from(document.scripts).slice(-1)[0];
+        const base = new URL(script.src).origin;
 
-      const s = (window.YOUCAN_POPUP || {});
-      const clientId = String(s.clientId || "").trim();
-      const key = String(s.key || "").trim();
+        const r = await fetch(base + "/api/popup-config");
+        const cfg = await r.json();
+        if (!cfg || !cfg.active) return;
 
-      if (!clientId || !key) {
-        console.log("POPUP: missing clientId/key");
-        return;
-      }
+        if (localStorage.getItem("popup_done")) return;
 
-      // Verify first
-      const vr = await fetch(base + "/api/verify?clientId=" + encodeURIComponent(clientId)
-        + "&store=" + encodeURIComponent(window.location.hostname)
-        + "&key=" + encodeURIComponent(key));
-      const vj = await vr.json();
-      if (!vj || vj.status !== "active") {
-        console.log("POPUP: inactive");
-        return;
-      }
-
-      // Get per-client config
-      const r = await fetch(base + "/api/popup-config?clientId=" + encodeURIComponent(clientId));
-      const cfg = await r.json();
-      if (!cfg || !cfg.active) return;
-
-      if (localStorage.getItem("popup_done")) return;
-
-      const wrap = document.createElement("div");
-      wrap.innerHTML = \`
-        <div style="
-          position:fixed;top:0;left:0;right:0;bottom:0;
-          background:rgba(0,0,0,.45);
-          display:flex;align-items:center;justify-content:center;
-          z-index:999999;">
-          <div style="
-            background:#fff;padding:16px;min-width:320px;
-            border-radius:12px;box-shadow:0 0 15px rgba(0,0,0,.2);
-            font-family:Arial,sans-serif">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-              <strong>\${cfg.title || ""}</strong>
-              <button id="popup_close" style="border:none;background:none;font-size:18px;cursor:pointer">×</button>
+        const wrap = document.createElement("div");
+        wrap.innerHTML = \`
+        <div style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:999999">
+          <div style="background:#fff;padding:16px;min-width:320px;border-radius:12px;font-family:Arial">
+            <div style="display:flex;justify-content:space-between">
+              <strong>\${cfg.title||""}</strong>
+              <button id="popup_close">×</button>
             </div>
-            <p style="margin:10px 0">\${cfg.text || ""}</p>
-            <input id="popup_email" type="email" placeholder="Email"
-              style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px"/>
-            <button id="popup_btn" style="
-              width:100%;margin-top:10px;padding:10px;border:none;
-              background:#111;color:#fff;border-radius:8px;cursor:pointer">
-              Get coupon
-            </button>
+            <p>\${cfg.text||""}</p>
+            <input id="popup_email" type="email" placeholder="Email" style="width:100%;padding:8px"/>
+            <button id="popup_btn" style="margin-top:10px;width:100%">Get coupon</button>
           </div>
         </div>\`;
 
-      document.body.appendChild(wrap);
+        document.body.appendChild(wrap);
+        document.getElementById("popup_close").onclick = () => wrap.remove();
 
-      document.getElementById("popup_close").onclick = () => wrap.remove();
+        document.getElementById("popup_btn").onclick = async () => {
+          const email = document.getElementById("popup_email").value.trim();
+          if (!email) return alert("كتب الإيميل أولاً");
 
-      document.getElementById("popup_btn").onclick = async () => {
-        const email = document.getElementById("popup_email").value.trim();
-        if (!email) return alert("كتب الإيميل أولاً");
-
-        try {
-          const rr = await fetch(base + "/api/lead", {
+          await fetch(base + "/api/lead", {
             method: "POST",
-            headers: {"Content-Type":"application/json"},
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              clientId: clientId,
               store: window.location.hostname,
-              email: email,
+              email,
               coupon: cfg.coupon || "",
               page: window.location.href
             })
           });
 
-          const jj = await rr.json().catch(() => ({}));
-
-          if (jj && jj.error === "free_limit_reached") {
-            alert("وصلتو للحد ديال النسخة المجانية");
-            return;
-          }
-
           localStorage.setItem("popup_done","1");
           alert("🎉 Coupon: " + (cfg.coupon || ""));
           wrap.remove();
-        } catch(e) {
-          console.log("LEAD POST ERROR:", e);
-          alert("وقع مشكل، عاود حاول");
-        }
-      };
-
-    } catch(e) {
-      console.log("POPUP ERROR:", e);
+        };
+      } catch(e) {
+        console.log("POPUP ERROR", e);
+      }
     }
-  }
-  run();
-})();`);
+    run();
+  })();`);
 });
 
-// =====================
-// ✅ Start
-// =====================
+/* =======================
+   START SERVER
+======================= */
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
+app.listen(PORT, () =>
+  console.log("✅ Server running on port " + PORT)
+);
