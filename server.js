@@ -7,30 +7,36 @@ const rateLimit = require("express-rate-limit");
 const { google } = require("googleapis");
 
 const app = express();
+app.set("trust proxy", 1);
+
+// ---------- BASIC ----------
 app.use(express.json({ limit: "1mb" }));
-app.use(helmet());
+app.use(express.urlencoded({ extended: true }));
 
-// ====== CONFIG ======
-const ADMIN_SHEET_ID = process.env.ADMIN_SHEET_ID;                 // ID ديال Admin Sheet
-const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_CREDENTIALS_JSON; // JSON ديال Service Account
-const ADMIN_CLIENTS_TAB = process.env.ADMIN_CLIENTS_TAB || "clients"; // اسم tab ديال clients فـ admin
-const DEFAULT_LEADS_TAB = process.env.DEFAULT_LEADS_TAB || "leads";   // اسم tab فـ sheet ديال كل client
-
-if (!ADMIN_SHEET_ID) console.log("⚠️ Missing env ADMIN_SHEET_ID");
-if (!GOOGLE_CREDENTIALS_JSON) console.log("⚠️ Missing env GOOGLE_CREDENTIALS_JSON");
-
-// CORS: خليه مفتوح شوية حيث clients غادي يكونو بزاف domains
+// ---------- SECURITY (بدون ما نبلوكي popup.js) ----------
 app.use(
-  cors({
-    origin: function (origin, cb) {
-      // allow server-to-server / no-origin
-      if (!origin) return cb(null, true);
-      return cb(null, true);
-    },
+  helmet({
+    crossOriginResourcePolicy: false, // ✅ مهم باش /popup.js مايتبلوكيش
   })
 );
 
-// Rate limit باش ما يضربكش spam
+// ✅ زيد هاد headers (مهمين بزاف)
+app.use((req, res, next) => {
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
+  next();
+});
+
+// ---------- CORS ----------
+app.use(
+  cors({
+    origin: true, // ✅ خليه true باش يجي من أي دومين (YouCan clients)
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
+// ---------- RATE LIMIT ----------
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -40,8 +46,18 @@ app.use(
   })
 );
 
-// ====== GOOGLE SHEETS AUTH ======
-function getSheetsClient() {
+// ---------- GOOGLE SHEETS ----------
+const ADMIN_SHEET_ID = process.env.ADMIN_SHEET_ID;
+const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_CREDENTIALS_JSON;
+
+if (!ADMIN_SHEET_ID) console.log("⚠️ Missing ADMIN_SHEET_ID in env");
+if (!GOOGLE_CREDENTIALS_JSON) console.log("⚠️ Missing GOOGLE_CREDENTIALS_JSON in env");
+
+function normalizeDomain(d) {
+  return (d || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+}
+
+async function getSheetsClient() {
   const creds = JSON.parse(GOOGLE_CREDENTIALS_JSON);
   const auth = new google.auth.GoogleAuth({
     credentials: creds,
@@ -50,228 +66,158 @@ function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
-function normDomain(d) {
-  const x = (d || "").trim().toLowerCase();
-  if (!x) return "";
-  return x.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+async function readClientsTable() {
+  const sheets = await getSheetsClient();
+  const range = "'clients'!A1:F"; // clientId, storeDomain, licenseKey, couponCode, sheetId, enabled
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: ADMIN_SHEET_ID,
+    range,
+  });
+
+  const rows = resp.data.values || [];
+  const header = rows[0] || [];
+  const data = rows.slice(1);
+
+  // map by header names (safer)
+  const idx = (name) => header.indexOf(name);
+
+  const out = data
+    .map((r) => ({
+      clientId: r[idx("clientId")] || r[0] || "",
+      storeDomain: r[idx("storeDomain")] || r[1] || "",
+      licenseKey: r[idx("licenseKey")] || r[2] || "",
+      couponCode: r[idx("couponCode")] || r[3] || "",
+      sheetId: r[idx("sheetId")] || r[4] || "",
+      enabled: String(r[idx("enabled")] || r[5] || "").toUpperCase() === "TRUE",
+    }))
+    .filter((x) => x.clientId && x.storeDomain);
+
+  return out;
 }
 
-async function safeGetValues(sheets, spreadsheetId, range) {
-  // range مثال: `'clients'!A1:Z`
-  const r = await sheets.spreadsheets.values.get({ spreadsheetId, range });
-  return (r.data && r.data.values) || [];
-}
+async function findClientByStore(store) {
+  const s = normalizeDomain(store);
+  const clients = await readClientsTable();
 
-async function findClientByStore(storeDomain) {
-  const sheets = getSheetsClient();
-  const storeN = normDomain(storeDomain);
-
-  // كنقراو clients tab من admin sheet
-  // كنستعملو quotes باش حتى إلا كان الاسم فيه شي رمز ما يوقعش error
-  const range = `'${ADMIN_CLIENTS_TAB}'!A1:Z`;
-
-  let values;
-  try {
-    values = await safeGetValues(sheets, ADMIN_SHEET_ID, range);
-  } catch (e) {
-    // فهاد الحالة 99% ADMIN_SHEET_ID غلط أو tab سميتها ماشي clients
-    throw new Error(
-      `Unable to read Admin clients tab. Check ADMIN_SHEET_ID and tab name. (${e.message})`
-    );
-  }
-
-  if (!values.length) return null;
-
-  const header = values[0].map((h) => (h || "").toString().trim());
-  const idx = (name) => header.findIndex((h) => h.toLowerCase() === name.toLowerCase());
-
-  const iClientId = idx("clientId");
-  const iStore = idx("storeDomain");
-  const iKey = idx("licenseKey");
-  const iCoupon = idx("couponCode");
-  const iSheetId = idx("sheetId");
-  const iEnabled = idx("enabled");
-
-  // مطلوبين
-  if (iStore < 0 || iKey < 0 || iSheetId < 0) {
-    throw new Error(
-      `Admin tab '${ADMIN_CLIENTS_TAB}' لازم يكون فيه الأعمدة: storeDomain, licenseKey, sheetId (ويمكن couponCode, enabled, clientId).`
-    );
-  }
-
-  for (let r = 1; r < values.length; r++) {
-    const row = values[r] || [];
-    const rowStore = normDomain(row[iStore] || "");
-    if (!rowStore) continue;
-
-    // كنقبل www ولا بلا www
-    if (rowStore === storeN) {
-      const enabledVal = (row[iEnabled] || "").toString().trim().toLowerCase();
-      const enabled =
-        iEnabled < 0 ? true : enabledVal === "true" || enabledVal === "1" || enabledVal === "yes";
-
-      return {
-        clientId: (iClientId >= 0 ? row[iClientId] : "") || storeN,
-        storeDomain: rowStore,
-        licenseKey: (row[iKey] || "").toString().trim(),
-        couponCode: (iCoupon >= 0 ? row[iCoupon] : "") || "",
-        sheetId: (row[iSheetId] || "").toString().trim(),
-        enabled,
-      };
-    }
-  }
-
-  return null;
-}
-
-async function appendLeadToClientSheet(sheetId, lead) {
-  const sheets = getSheetsClient();
-  const tab = DEFAULT_LEADS_TAB;
-
-  // نديرو header إلا ما كايناش
-  // كنقراو أول صف
-  let firstRow = [];
-  try {
-    firstRow = await safeGetValues(sheets, sheetId, `'${tab}'!A1:E1`);
-  } catch (e) {
-    // إذا tab leads ما كايناش، Google API غادي يعطي error
-    // أسهل حل: خلي client يدير tab سميتها leads فـ sheet ديالو.
-    throw new Error(
-      `Client sheet missing tab '${tab}'. Create a tab named '${tab}' in client sheet. (${e.message})`
-    );
-  }
-
-  const headerWanted = ["time", "store", "email", "coupon", "page"];
-  const hasHeader =
-    firstRow &&
-    firstRow[0] &&
-    headerWanted.every((h, i) => ((firstRow[0][i] || "").toString().toLowerCase() === h));
-
-  if (!hasHeader) {
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: sheetId,
-      range: `'${tab}'!A1:E1`,
-      valueInputOption: "RAW",
-      requestBody: { values: [headerWanted] },
-    });
-  }
-
-  // Dedupe بسيط: نفس email + store فآخر 24 ساعة
-  // (اختياري) إذا بغيتيه قوي أكثر نقلبو فـ sheet ولكن هادشي كيكون ثقيل.
-  const valuesRow = [
-    lead.time,
-    lead.store,
-    lead.email,
-    lead.coupon || "",
-    lead.page || "",
-  ];
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
-    range: `'${tab}'!A:E`,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: [valuesRow] },
+  // supports www و بلا www
+  return clients.find((c) => {
+    const dom = normalizeDomain(c.storeDomain);
+    return dom === s || dom === s.replace(/^www\./, "") || ("www." + dom) === s;
   });
 }
 
-// ====== ROUTES ======
+async function appendLeadToClientSheet(sheetId, lead) {
+  const sheets = await getSheetsClient();
+
+  // ✅ فـ sheet ديال client خاص tab اسميتو leads
+  const range = "'leads'!A1:E";
+  const values = [[lead.time, lead.store, lead.email, lead.coupon, lead.page]];
+
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: sheetId,
+    range,
+    valueInputOption: "RAW",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: { values },
+  });
+}
+
+// ---------- ROUTES ----------
 app.get("/", (req, res) => res.send("🚀 Server khdam mzyan"));
 
-app.get("/api/status", (req, res) => res.json({ ok: true }));
-
-// VERIFY: كيتأكد من licenseKey ديال store (للـ SaaS)
+// ✅ verify (SaaS)
 app.get("/api/verify", async (req, res) => {
   try {
-    const store = (req.query.store || "").trim();
+    const store = normalizeDomain(req.query.store);
     const key = (req.query.key || "").trim();
 
-    console.log("VERIFY HIT:", { store, key, time: new Date().toISOString() });
+    const client = await findClientByStore(store);
+    if (!client || !client.enabled) return res.json({ ok: true, status: "inactive" });
 
-    const c = await findClientByStore(store);
-    if (!c) return res.json({ ok: true, status: "inactive" });
-    if (!c.enabled) return res.json({ ok: true, status: "inactive" });
-
-    if (c.licenseKey && key === c.licenseKey) {
-      return res.json({ ok: true, status: "active", couponCode: c.couponCode || "" });
+    if (client.licenseKey && key !== client.licenseKey) {
+      return res.json({ ok: true, status: "inactive" });
     }
-    return res.json({ ok: true, status: "inactive" });
+
+    return res.json({ ok: true, status: "active", couponCode: client.couponCode || "" });
   } catch (e) {
     console.log("VERIFY ERROR:", e.message);
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: "server_error" });
   }
 });
 
-// POPUP CONFIG: كيجيب config حسب storeDomain
+// ✅ popup config per store
 app.get("/api/popup-config", async (req, res) => {
   try {
-    const store = (req.query.store || "").trim();
-    const c = await findClientByStore(store);
+    const store = normalizeDomain(req.query.store || req.headers.origin || "");
+    const client = await findClientByStore(store);
+    if (!client || !client.enabled) return res.json({ active: false });
 
-    if (!c || !c.enabled) {
-      return res.json({ active: false });
-    }
-
-    // هنا تقدر تزيد title/text per client من admin sheet لاحقاً
-    return res.json({
+    res.json({
       active: true,
       title: "🔥 خصم خاص!",
       text: "دخل الإيميل ديالك وخد 10% دابا",
-      coupon: c.couponCode || "",
-      clientId: c.clientId,
+      coupon: client.couponCode || "",
+      clientId: client.clientId,
     });
   } catch (e) {
     console.log("POPUP CONFIG ERROR:", e.message);
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ active: false });
   }
 });
 
-// LEAD: كيسجل lead فـ sheet ديال client
+// ✅ receive lead + write to client sheet
 app.post("/api/lead", async (req, res) => {
   try {
-    const body = req.body || {};
-    const store = (body.store || "").trim();
-    const email = (body.email || "").trim();
-    const coupon = (body.coupon || "").trim();
-    const page = (body.page || "").trim();
+    const store = normalizeDomain(req.body.store || "");
+    const email = (req.body.email || "").trim();
+    const coupon = (req.body.coupon || "").trim();
+    const page = (req.body.page || "").trim();
 
-    if (!store || !email) return res.status(400).json({ ok: false, error: "Missing store/email" });
+    if (!store || !email) return res.status(400).json({ ok: false, error: "missing_store_or_email" });
 
-    const c = await findClientByStore(store);
-    if (!c || !c.enabled) return res.json({ ok: true, skipped: true });
+    const client = await findClientByStore(store);
+    if (!client || !client.enabled) return res.json({ ok: true });
 
     const lead = {
-      clientId: c.clientId,
-      store: normDomain(store),
-      email,
-      coupon,
-      page,
       time: new Date().toISOString(),
+      store,
+      email,
+      coupon: coupon || client.couponCode || "",
+      page,
+      clientId: client.clientId,
     };
 
     console.log("✅ NEW LEAD:", lead);
 
-    await appendLeadToClientSheet(c.sheetId, lead);
+    if (!client.sheetId) {
+      console.log("LEAD WARN: client sheetId empty");
+      return res.json({ ok: true });
+    }
 
-    return res.json({ ok: true });
+    await appendLeadToClientSheet(client.sheetId, lead);
+
+    res.json({ ok: true });
   } catch (e) {
     console.log("LEAD ERROR:", e.message);
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: "lead_error" });
   }
 });
 
-// POPUP JS: كيتخدم فـ YouCan
+// ✅ external script popup.js (must be cross-origin)
 app.get("/popup.js", (req, res) => {
   res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  // ✅ باش يسمح بتحميل السكريبت من أي دومين
+  res.setHeader("Access-Control-Allow-Origin", "*");
 
   res.send(`(function () {
   async function run() {
     try {
       const script = document.currentScript || Array.from(document.scripts).slice(-1)[0];
       const base = new URL(script.src).origin;
-      const store = encodeURIComponent(window.location.hostname);
+      const store = window.location.hostname;
 
-      const r = await fetch(base + "/api/popup-config?store=" + store);
+      const r = await fetch(base + "/api/popup-config?store=" + encodeURIComponent(store));
       const cfg = await r.json();
       if (!cfg || !cfg.active) return;
 
@@ -315,7 +261,7 @@ app.get("/popup.js", (req, res) => {
             method: "POST",
             headers: {"Content-Type":"application/json"},
             body: JSON.stringify({
-              store: window.location.hostname,
+              store: store,
               email: email,
               coupon: cfg.coupon || "",
               page: window.location.href
@@ -330,6 +276,7 @@ app.get("/popup.js", (req, res) => {
           alert("وقع مشكل، عاود حاول");
         }
       };
+
     } catch(e) {
       console.log("POPUP ERROR:", e);
     }
@@ -338,6 +285,6 @@ app.get("/popup.js", (req, res) => {
 })();`);
 });
 
-// ====== START ======
+// ---------- START ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
